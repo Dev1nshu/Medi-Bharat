@@ -1,147 +1,190 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
+const pool = require("./db"); // PostgreSQL connection
+
 const app = express();
 const PORT = 5000;
 
+// Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-// Simple In-memory database simulation
-let medicineStock = [
-  { id: 1, name: "Paracetamol", qty: 100, price: 1.5 },
-  { id: 2, name: "Amoxicillin", qty: 50, price: 2.5 },
-  { id: 3, name: "Ibuprofen", qty: 75, price: 1.2 },
-];
-let salesHistory = [];
-let nextMedicineId = 4;
-let nextSaleId = 1;
-
-// --- Medicine CRUD Endpoints ---
-
-// GET /medicines
-app.get("/medicines", (req, res) => {
-  res.json(medicineStock);
-});
-
-// POST /medicines (Add)
-app.post("/medicines", (req, res) => {
-  const { name, qty, price } = req.body;
-  const newMedicine = { id: nextMedicineId++, name, qty, price };
-  medicineStock.push(newMedicine);
-  res.status(201).json(newMedicine);
-});
-
-// PUT /medicines/:id (Update)
-app.put("/medicines/:id", (req, res) => {
-  const id = parseInt(req.params.id);
-  const index = medicineStock.findIndex((m) => m.id === id);
-  if (index !== -1) {
-    medicineStock[index] = { ...medicineStock[index], ...req.body, id };
-    res.json(medicineStock[index]);
-  } else {
-    res.status(404).json({ message: "Medicine not found" });
+// =============================
+// ✅ Test Database Connection
+// =============================
+app.get("/testdb", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW()");
+    res.json({ msg: "DB connected", time: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ msg: "DB error" });
   }
 });
 
-// DELETE /medicines/:id
-app.delete("/medicines/:id", (req, res) => {
-  const id = parseInt(req.params.id);
-  medicineStock = medicineStock.filter((m) => m.id !== id);
-  res.status(204).send();
+
+// =============================
+// 💊 MEDICINES TABLE ROUTES
+// =============================
+
+// ➕ Add Medicine
+app.post("/medicines", async (req, res) => {
+  const { name, qty, price } = req.body;
+  try {
+    const result = await pool.query(
+      "INSERT INTO medicines (name, qty, price) VALUES ($1, $2, $3) RETURNING *",
+      [name, qty, price]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Error adding medicine:", err);
+    res.status(500).json({ message: "Error adding medicine" });
+  }
 });
 
-// --- Sales Endpoints ---
-
-// GET /sales
-app.get("/sales", (req, res) => {
-  res.json(salesHistory);
+// 📦 Get All Medicines
+app.get("/medicines", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM medicines ORDER BY id ASC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching medicines:", err);
+    res.status(500).json({ message: "Error fetching medicines" });
+  }
 });
 
-// POST /sales/process-order
-app.post("/sales/process-order", (req, res) => {
+// ✏️ Update Medicine
+app.put("/medicines/:id", async (req, res) => {
+  const { id } = req.params;
+  const { name, qty, price } = req.body;
+  try {
+    const result = await pool.query(
+      "UPDATE medicines SET name=$1, qty=$2, price=$3 WHERE id=$4 RETURNING *",
+      [name, qty, price, id]
+    );
+    if (result.rows.length === 0)
+      return res.status(404).json({ message: "Medicine not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error updating medicine:", err);
+    res.status(500).json({ message: "Error updating medicine" });
+  }
+});
+
+// 🗑️ Delete Medicine
+app.delete("/medicines/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query("DELETE FROM medicines WHERE id=$1", [id]);
+    res.status(204).send();
+  } catch (err) {
+    console.error("Error deleting medicine:", err);
+    res.status(500).json({ message: "Error deleting medicine" });
+  }
+});
+
+
+// =============================
+// 💰 SALES TABLE ROUTES
+// =============================
+
+// ➕ Process Order (Add Sale)
+app.post("/sales/process-order", async (req, res) => {
   const { customerName, prescriptionFile, cart } = req.body;
 
-  if (cart.length === 0) {
+  if (!cart || cart.length === 0) {
     return res.status(400).json({ message: "Cart is empty." });
   }
 
-  let orderTotal = 0;
-  const soldItems = [];
+  const client = await pool.connect(); // create a client for transaction
 
-  // 1. Process cart and update stock
-  for (const item of cart) {
-    const medIndex = medicineStock.findIndex((m) => m.id === item.medicineId);
+  try {
+    let orderTotal = 0;
+    await client.query("BEGIN");
 
-    if (medIndex === -1 || medicineStock[medIndex].qty < item.qty) {
-      return res.status(400).json({ message: `Insufficient stock for ${item.name}` });
+    // 1️⃣ Create sale entry
+    const saleResult = await client.query(
+      "INSERT INTO sales (customer_name, prescription_file, order_total) VALUES ($1, $2, $3) RETURNING id",
+      [customerName, prescriptionFile, 0]
+    );
+    const saleId = saleResult.rows[0].id;
+
+    // 2️⃣ Process each item in cart
+    for (const item of cart) {
+      const { medicineId, qty, price, name } = item;
+
+      const medResult = await client.query(
+        "SELECT * FROM medicines WHERE id=$1",
+        [medicineId]
+      );
+      const med = medResult.rows[0];
+
+      if (!med || med.qty < qty) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: `Insufficient stock for ${name}` });
+      }
+
+      // Deduct stock
+      await client.query("UPDATE medicines SET qty = qty - $1 WHERE id=$2", [
+        qty,
+        medicineId,
+      ]);
+
+      // Add item to sale_items
+      const total = qty * price;
+      await client.query(
+        "INSERT INTO sale_items (sale_id, medicine_id, qty, price, total) VALUES ($1, $2, $3, $4, $5)",
+        [saleId, medicineId, qty, price, total]
+      );
+
+      orderTotal += total;
     }
 
-    // Update stock
-    medicineStock[medIndex].qty -= item.qty;
+    // 3️⃣ Update total in sales
+    await client.query("UPDATE sales SET order_total=$1 WHERE id=$2", [
+      orderTotal,
+      saleId,
+    ]);
 
-    // Calculate total
-    const itemTotal = item.qty * item.price;
-    orderTotal += itemTotal;
-    
-    // Record sold item details
-    soldItems.push({
-      medicineId: item.medicineId,
-      name: item.name,
-      qty: item.qty,
-      price: item.price,
-      total: itemTotal
-    });
+    await client.query("COMMIT");
+    res.status(201).json({ message: "Order processed successfully", saleId, orderTotal });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Error processing order:", err);
+    res.status(500).json({ message: "Error processing order" });
+  } finally {
+    client.release();
   }
-
-  // 2. Record sale
-  const newOrder = {
-    id: nextSaleId++,
-    customerName,
-    prescriptionFile,
-    items: soldItems,
-    orderTotal,
-    date: new Date().toISOString(),
-  };
-
-  salesHistory.push(newOrder);
-
-  // 3. Respond
-  res.status(201).json({ 
-    message: "Order processed successfully", 
-    order: newOrder 
-  });
 });
 
-/**
- * DELETE /sales/:id
- * Removes a sale record and restores the sold items back to medicine stock.
- */
-app.delete("/sales/:id", (req, res) => {
-  const id = parseInt(req.params.id);
-  const saleIndex = salesHistory.findIndex((s) => s.id === id);
-
-  if (saleIndex === -1) {
-    return res.status(404).json({ message: "Sale record not found" });
+// 📜 Get All Sales
+app.get("/sales", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM sales ORDER BY id DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching sales:", err);
+    res.status(500).json({ message: "Error fetching sales" });
   }
-
-  const deletedSale = salesHistory[saleIndex];
-
-  // 1. Restore Stock
-  for (const item of deletedSale.items) {
-    const medIndex = medicineStock.findIndex((m) => m.id === item.medicineId);
-    if (medIndex !== -1) {
-      medicineStock[medIndex].qty += item.qty;
-    }
-  }
-
-  // 2. Remove Sale from History
-  salesHistory.splice(saleIndex, 1);
-
-  res.status(204).send();
 });
 
-// --- Start Server ---
+// 🗑️ Delete Sale
+app.delete("/sales/:id", async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query("DELETE FROM sales WHERE id=$1", [id]);
+    res.status(204).send();
+  } catch (err) {
+    console.error("Error deleting sale:", err);
+    res.status(500).json({ message: "Error deleting sale" });
+  }
+});
+
+
+// =============================
+// 🚀 Start Server
+// =============================
 app.listen(PORT, () => {
-  console.log(`Backend running at http://localhost:${PORT}`);
+  console.log(`✅ Backend running at http://localhost:${PORT}`);
 });
