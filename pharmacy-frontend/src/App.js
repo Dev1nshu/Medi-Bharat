@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 
-// --- CONSTANT FOR LOW STOCK THRESHOLD ---
+// -- CONSTANT FOR LOW STOCK THRESHOLD --
 const LOW_STOCK_THRESHOLD = 20;
 
 // --- LOCAL DATA STORE INITIALIZATION ---
